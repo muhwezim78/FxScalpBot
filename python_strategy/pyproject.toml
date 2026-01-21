@@ -1,0 +1,37 @@
+[project]
+name = "python_strategy"
+version = "0.1.0"
+description = "Python strategy layer for FxScalpBot momentum scalping"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "MetaTrader5",
+    "python-dotenv",
+    "toml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.0.0",
+    "ruff>=0.1.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "B", "Q"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true

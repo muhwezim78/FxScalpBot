@@ -1,0 +1,47 @@
+# ===== ENV FILES =====
+.env
+
+# ===== PYTHON =====
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+*.sqlite3
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Python build
+build/
+dist/
+*.egg-info/
+
+# ===== RUST =====
+target/
+Cargo.lock
+
+# Rust logs & debug dumps
+*.log
+*.txt
+rust_debug.txt
+build_log*.txt
+build_errors.log
+errors.txt
+check_err.txt
+
+# ===== OS FILES =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== IDE =====
+.vscode/
+.idea/
+
+# ===== TEMP =====
+*.tmp
+*.swp
+*.bak

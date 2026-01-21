@@ -1,0 +1,59 @@
+# Risk Limits Configuration
+# These are HARD LIMITS enforced by Rust. No exceptions.
+
+[market]
+# Symbols to monitor and trade
+symbols = ["EURUSDm","XAUUSDm"]
+
+[account]
+# Daily loss limit as percentage of account balance
+daily_loss_limit_pct = 0.02  # 2%
+
+# Maximum position size in lots (absolute cap)
+max_position_lots = 500.0
+
+# Base lot size per $1,000 of account balance (10:1 Leverage)
+lot_per_1000 = 0.1
+
+# Risk per trade as percentage of equity
+risk_per_trade_pct = 0.005  # 0.5%
+
+[scaling]
+# Maximum number of scale-ins per trading run
+max_scales = 5
+
+# Minimum locked profit required to scale ($)
+min_scale_profit = 5.0
+
+# Maximum lots per scale-in
+max_scale_lots = 1.1
+
+# Percentage of locked profit usable for scaling
+profit_scale_ratio = 0.8  # Only 50% of locked profits
+
+[exit]
+# Maximum acceptable reversal before forced exit
+reversal_threshold_pct = 0.20  # Tightened to 20% for aggressive harvesting
+
+# Stall timeout - exit if no price movement
+stall_timeout_ms = 10000  # Tighten to 10s for faster scalp turns
+
+# Cooldown after trade closes
+cooldown_seconds = 15     # Faster recovery for EURUSD bursts
+
+[execution]
+# Maximum acceptable spread (as multiple of average)
+max_spread_multiplier = 1.5
+
+# Maximum acceptable latency
+max_latency_ms = 50
+
+# Maximum acceptable slippage per trade
+max_slippage_pips = 10.0
+
+[overrides.XAUUSDm]
+max_spread_multiplier = 1.5
+max_slippage_pips = 5.0
+stall_timeout_ms = 20000 
+
+# EURUSD uses globals

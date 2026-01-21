@@ -1,0 +1,46 @@
+# Strategy Parameters Configuration
+# These are adjustable parameters for the Python strategy layer
+
+[momentum]
+# Minimum velocity (pips/second) to detect momentum
+velocity_threshold = 0.5
+
+# Minimum acceleration to confirm momentum
+acceleration_threshold = 0.1
+
+# Minimum signal strength (0.0-1.0) to trade
+strength_threshold = 0.3
+
+# Number of ticks for momentum analysis
+analysis_window = 50
+
+# Volume surge threshold (multiple of average)
+volume_surge_multiplier = 1.5
+
+[volatility]
+# ATR calculation window
+atr_window = 14
+
+# ATR multiple for "high" volatility
+high_volatility_threshold = 2.0
+
+# ATR multiple for "extreme" volatility (block trading)
+extreme_volatility_threshold = 3.0
+
+[timing]
+# News blackout minutes (around major releases)
+news_blackout_minutes = 5
+
+# Low liquidity hours to avoid (UTC)
+# Format: [start_hour, end_hour]
+low_liquidity_periods = [[21, 24], [0, 2]]
+
+[profit_target]
+# Take profit in pips (conservative)
+default_tp_pips = 5.0
+
+# Stop loss in pips (tight for scalping)
+default_sl_pips = 3.0
+
+# Adjust TP based on volatility
+volatility_tp_multiplier = 1.5  # In high vol, TP = 7.5 pips
