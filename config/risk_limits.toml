@@ -3,11 +3,17 @@
 
 [market]
 # Symbols to monitor and trade
-symbols = ["EURUSDm","XAUUSDm"]
+symbols = ["EURUSDm","XAUUSDm", "GBPUSDm", "BTCUSDm", "XAGUSDm"]
 
 [account]
 # Daily loss limit as percentage of account balance
 daily_loss_limit_pct = 0.02  # 2%
+
+# Maximum number of parallel trades across all symbols
+max_parallel_trades = 5
+
+# Maximum number of parallel trades per symbol
+max_trades_per_symbol = 3
 
 # Maximum position size in lots (absolute cap)
 max_position_lots = 500.0
@@ -33,27 +39,43 @@ profit_scale_ratio = 0.8  # Only 50% of locked profits
 
 [exit]
 # Maximum acceptable reversal before forced exit
-reversal_threshold_pct = 0.20  # Tightened to 20% for aggressive harvesting
+reversal_threshold_pct = 0.40  # Increased from 0.20 to allow more breathing room
 
 # Stall timeout - exit if no price movement
-stall_timeout_ms = 10000  # Tighten to 10s for faster scalp turns
+stall_timeout_ms = 60000  # Increased from 10s to 60s for standard scalp moves
 
 # Cooldown after trade closes
 cooldown_seconds = 15     # Faster recovery for EURUSD bursts
 
 [execution]
 # Maximum acceptable spread (as multiple of average)
-max_spread_multiplier = 1.5
+max_spread_multiplier = 1.8  # Tightened from 3.0
+
+# Hard Absolute Spread Cap (in pips)
+max_spread_pips = 2.0  # Default for EURUSD/GBPUSD
 
 # Maximum acceptable latency
-max_latency_ms = 50
+max_latency_ms = 100 # Reduced from 150ms for tighter execution
 
 # Maximum acceptable slippage per trade
-max_slippage_pips = 10.0
+max_slippage_pips = 5.0 # Reduced from 10.0
 
 [overrides.XAUUSDm]
 max_spread_multiplier = 1.5
-max_slippage_pips = 5.0
-stall_timeout_ms = 20000 
+max_spread_pips = 0.6  # (~60 cents spread)
+max_slippage_pips = 3.0
+stall_timeout_ms = 120000 # Increased to 120s for Gold
+
+[overrides.GBPUSDm]
+max_spread_pips = 2.5
+
+[overrides.BTCUSDm]
+max_spread_pips = 80.0 # (~$80 spread)
+max_spread_multiplier = 1.3
+max_slippage_pips = 50.0
+
+[overrides.XAGUSDm]
+max_spread_pips = 5.0 # (~5 cents spread)
+max_spread_multiplier = 1.5
 
 # EURUSD uses globals

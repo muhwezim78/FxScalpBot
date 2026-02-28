@@ -76,6 +76,9 @@ pub struct Position {
     pub current_price: f64,
     pub unrealized_pnl: f64,
     pub opened_at_ms: u64,
+    pub point: f64,      // Added for accurate P&L
+    pub tick_value: f64, // Added for accurate P&L
+    pub digits: u32,     // Added for pip calculation
 }
 
 impl Position {
@@ -86,13 +89,23 @@ impl Position {
             OrderSide::Sell => ask,  // Close price for shorts
         };
         
-        let pip_value = 10.0; // Per standard lot per pip (simplified)
         let price_diff = match self.side {
             OrderSide::Buy => self.current_price - self.entry_price,
             OrderSide::Sell => self.entry_price - self.current_price,
         };
         
-        self.unrealized_pnl = price_diff * 10000.0 * self.lots * pip_value;
+        // Exact P&L Formula: (PriceDiff / Point) * TickValue * Lots
+        if self.point > 0.0 {
+            self.unrealized_pnl = (price_diff / self.point) * self.tick_value * self.lots;
+        } else {
+            // Fallback to pips if point is missing
+            let multiplier = match self.digits {
+                5 | 4 => 10000.0,
+                3 => 100.0,
+                _ => 1.0,
+            };
+            self.unrealized_pnl = price_diff * multiplier * self.lots * 10.0;
+        }
     }
 }
 
@@ -194,6 +207,9 @@ impl OrderExecutor {
         order_id: u64,
         fill_price: f64,
         requested_price: Option<f64>,
+        point: f64,
+        tick_value: f64,
+        digits: u32,
     ) -> Result<Fill, String> {
         let order = self.pending_orders
             .remove(&order_id)
@@ -201,7 +217,12 @@ impl OrderExecutor {
         
         // Calculate slippage
         let slippage_pips = if let Some(req_price) = requested_price {
-            (fill_price - req_price).abs() * 10000.0
+            let multiplier = match digits {
+                5 | 4 => 10000.0,
+                3 => 100.0,
+                _ => 1.0,
+            };
+            (fill_price - req_price).abs() * multiplier
         } else {
             0.0
         };
@@ -229,7 +250,7 @@ impl OrderExecutor {
         };
         
         // Update position
-        self.update_position(&fill);
+        self.update_position(&fill, point, tick_value, digits);
         
         // Record fill
         self.fills.push(fill.clone());
@@ -245,7 +266,7 @@ impl OrderExecutor {
     }
     
     /// Update position based on fill
-    fn update_position(&mut self, fill: &Fill) {
+    fn update_position(&mut self, fill: &Fill, point: f64, tick_value: f64, digits: u32) {
         let now = Self::now_ms();
         if let Some(existing) = self.positions.get_mut(&fill.symbol) {
             if existing.side == fill.side {
@@ -255,6 +276,10 @@ impl OrderExecutor {
                     + fill.price * fill.lots) / total_lots;
                 existing.lots = total_lots;
                 existing.entry_price = avg_price;
+                // Update metadata in case it changed
+                existing.point = point;
+                existing.tick_value = tick_value;
+                existing.digits = digits;
             } else {
                 // Reducing or closing position
                 if fill.lots >= existing.lots {
@@ -270,6 +295,9 @@ impl OrderExecutor {
                             current_price: fill.price,
                             unrealized_pnl: 0.0,
                             opened_at_ms: now,
+                            point,
+                            tick_value,
+                            digits,
                         };
                     } else {
                         // Closed
@@ -290,6 +318,9 @@ impl OrderExecutor {
                 current_price: fill.price,
                 unrealized_pnl: 0.0,
                 opened_at_ms: now,
+                point,
+                tick_value,
+                digits,
             });
         }
     }

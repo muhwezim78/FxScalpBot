@@ -265,6 +265,9 @@ mod tests {
             ask_volume: 1000.0,
             timestamp_ms: now,
             received_at_ms: now,
+            digits: 5,
+            point: 0.00001,
+            tick_value: 1.0,
         }
     }
     

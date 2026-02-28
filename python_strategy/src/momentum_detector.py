@@ -52,13 +52,13 @@ class MomentumSignal:
     volume_surge: bool
 
 
-# Configuration - High Precision Impulse Thresholds (Balanced for Frequency)
-VELOCITY_THRESHOLD_POINTS = 6.0 # Reduced from 8.0 for better sensitivity
-STRENGTH_THRESHOLD = 0.4       # Reduced from 0.5
-IMPULSE_BODY_RATIO = 0.60      # 60% of candle (from 65%)
-IMPULSE_CLOSE_PERCENT = 0.25   # Close must be in top/bottom 25% (from 15%)
-EMA_SLOPE_THRESHOLD_POINTS = 3.0 # Reduced from 5.0
-ACCEPTANCE_TICKS = 3           # Reduced from 5 for faster sub-second entry
+# Configuration - Ultra Aggressive Scalping Mode
+VELOCITY_THRESHOLD_POINTS = 2.0 # Very low: enters on minor movement
+STRENGTH_THRESHOLD = 0.2       # Minimal strength required
+IMPULSE_BODY_RATIO = 0.30      # Permits large wicks/high noise
+IMPULSE_CLOSE_PERCENT = 0.50   # Permits entry even if price pulls back 50%
+EMA_SLOPE_THRESHOLD_POINTS = 0.5 # Minimal trend alignment
+ACCEPTANCE_TICKS = 1           # Instant entry on first confirmation tick
 WINDOW_TICKS = 30              # Analysis window
 EMA_PERIOD = 20                
 ATR_PERIOD = 20                
@@ -223,35 +223,34 @@ def detect_momentum(ticks: List[Dict[str, Any]]) -> Dict[str, Any]:
     ema_slope = ema[-1] - ema[-4] if len(ema) >= 4 else 0.0
     
     # 3. ATR Expansion (Rule 9)
-    # Simulate high/low/close from ticks for ATR
+    # Use real high/low data from bid/ask spreads instead of estimating
     closes = mid_prices
-    highs = mid_prices + (point * 1.0) # Conservative estimate
-    lows = mid_prices - (point * 1.0)
+    highs = asks
+    lows = bids
     atr_now = calculate_atr(highs, lows, closes, ATR_PERIOD)
     atr_prev = calculate_atr(highs[:-5], lows[:-5], closes[:-5], ATR_PERIOD)
-    volatility_expanding = atr_now > atr_prev * 1.02 if atr_prev > 0 else True
+    volatility_expanding = atr_now >= atr_prev if atr_prev > 0 else True  # Relaxed: any expansion counts
 
     # 4. Breakout Acceptance (Rule 4)
     direction = 1 if velocity > 0 else -1 if velocity < 0 else 0
     
-    # Acceptance: Check last 3 ticks against the tick before them
+    # Acceptance: Check last 2 ticks against the tick before them
     acceptance_valid = False
-    if len(mid_prices) > 4:
-        recent = mid_prices[-3:]
-        level = mid_prices[-4]
-        if direction == 1: acceptance_valid = all(p >= level for p in recent)
-        elif direction == -1: acceptance_valid = all(p <= level for p in recent)
+    if len(mid_prices) > 3:
+        recent_mids = mid_prices[-2:]
+        level = mid_prices[-3]
+        if direction == 1: acceptance_valid = all(p >= level for p in recent_mids)
+        elif direction == -1: acceptance_valid = all(p <= level for p in recent_mids)
     
     trend_valid = (ema_slope > ema_slope_threshold and direction == 1) or \
                   (ema_slope < -ema_slope_threshold and direction == -1)
 
-    # 5. Volume Gate
+    # 5. Volume Gate - Relaxed to 1.0 (any volume)
     total_vols = np.array([t.get("bid_volume", t.get("volume", 0)) for t in recent])
     vol_ratio = np.mean(total_vols[-5:]) / np.mean(total_vols[:-5]) if len(total_vols) > 10 else 1.0
-    volume_valid = vol_ratio >= 1.5
+    volume_valid = vol_ratio >= 1.0  
 
-    # ZERO LAG STATE GATE
-    # Consolidates all rules into one instant boolean check
+    # ZERO LAG STATE GATE - Ultra Aggressive
     detected = (
         abs(velocity) > velocity_threshold and
         impulse_valid and
@@ -272,7 +271,33 @@ def detect_momentum(ticks: List[Dict[str, Any]]) -> Dict[str, Any]:
         "volatility_expanding": bool(volatility_expanding),
         "acceptance_valid": bool(acceptance_valid),
         "volume_surge": bool(volume_valid),
+        "rejection_reasons": _get_rejection_reasons(
+            velocity, velocity_threshold, impulse_valid, trend_valid, 
+            volume_valid, volatility_expanding, acceptance_valid
+        ),
     }
+
+
+def _get_rejection_reasons(
+    velocity: float, velocity_threshold: float, impulse_valid: bool,
+    trend_valid: bool, volume_valid: bool, volatility_expanding: bool,
+    acceptance_valid: bool
+) -> list:
+    """Helper to list why a signal was rejected."""
+    reasons = []
+    if abs(velocity) <= velocity_threshold:
+        reasons.append(f"Velocity too low ({abs(velocity):.2f} <= {velocity_threshold:.4f})")
+    if not impulse_valid:
+        reasons.append("Impulse quality failed (body/close ratio)")
+    if not trend_valid:
+        reasons.append("EMA slope not aligned with direction")
+    if not volume_valid:
+        reasons.append("Volume surge insufficient")
+    if not volatility_expanding:
+        reasons.append("Volatility not expanding")
+    if not acceptance_valid:
+        reasons.append("Breakout acceptance failed")
+    return reasons
 
 
 def analyze_momentum_decay(

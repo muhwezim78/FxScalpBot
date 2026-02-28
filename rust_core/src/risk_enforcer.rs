@@ -10,7 +10,8 @@ use tracing::{warn, info};
 #[derive(Debug, Clone, PartialEq)]
 pub enum RiskVeto {
     DailyLimitHit,
-    PositionExists,
+    MaxParallelTradesReached,
+    MaxTradesPerSymbolReached,
     MaxScalesReached,
     InsufficientLockedProfit,
     LotSizeExceeded,
@@ -25,7 +26,8 @@ impl std::fmt::Display for RiskVeto {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RiskVeto::DailyLimitHit => write!(f, "Daily loss limit reached"),
-            RiskVeto::PositionExists => write!(f, "Position already open"),
+            RiskVeto::MaxParallelTradesReached => write!(f, "Maximum parallel trades reached"),
+            RiskVeto::MaxTradesPerSymbolReached => write!(f, "Maximum trades for this symbol reached"),
             RiskVeto::MaxScalesReached => write!(f, "Maximum scale-ins reached (3)"),
             RiskVeto::InsufficientLockedProfit => write!(f, "Not enough locked profit to scale"),
             RiskVeto::LotSizeExceeded => write!(f, "Lot size exceeds maximum"),
@@ -107,9 +109,12 @@ pub struct Account {
 }
 
 /// Risk Enforcer - enforces all hard limits
+#[derive(Debug, Clone)]
 pub struct RiskEnforcer {
     daily_loss_limit: f64,      // Absolute $ limit (calculated from %)
     daily_loss_pct: f64,        // Percentage limit
+    max_parallel_trades: u32,
+    max_trades_per_symbol: u32,
     max_position_lots: f64,
     lot_per_1000: f64,          // Base sizing
     max_scales: u8,
@@ -120,6 +125,7 @@ pub struct RiskEnforcer {
     risk_per_trade_pct: f64,
     min_scale_profit: f64,
     profit_scale_ratio: f64,    // Portion of locked profit usable
+    max_spread_pips: f64,
     overrides: std::collections::HashMap<String, crate::SymbolOverride>,
 }
 
@@ -128,6 +134,8 @@ impl RiskEnforcer {
         Self {
             daily_loss_limit: 0.0, 
             daily_loss_pct: config.account.daily_loss_limit_pct,
+            max_parallel_trades: config.account.max_parallel_trades,
+            max_trades_per_symbol: config.account.max_trades_per_symbol,
             max_position_lots: config.account.max_position_lots,
             lot_per_1000: config.account.lot_per_1000,
             max_scales: config.scaling.max_scales,
@@ -138,6 +146,7 @@ impl RiskEnforcer {
             risk_per_trade_pct: config.account.risk_per_trade_pct,
             min_scale_profit: config.scaling.min_scale_profit,
             profit_scale_ratio: config.scaling.profit_scale_ratio,
+            max_spread_pips: config.execution.max_spread_pips,
             overrides: config.overrides.clone().unwrap_or_default(),
         }
     }
@@ -159,6 +168,13 @@ impl RiskEnforcer {
             .unwrap_or(self.max_spread_multiplier)
     }
 
+    /// Retrieve the applicable max_spread_pips for a symbol
+    pub fn get_max_spread_pips(&self, symbol: &str) -> f64 {
+        self.overrides.get(symbol)
+            .and_then(|o| o.max_spread_pips)
+            .unwrap_or(self.max_spread_pips)
+    }
+
     /// Retrieve the applicable max_latency_ms for a symbol
     pub fn get_max_latency_ms(&self, symbol: &str) -> u64 {
         self.overrides.get(symbol)
@@ -174,30 +190,51 @@ impl RiskEnforcer {
     }
     
     /// Check if a new entry is allowed
-    pub fn can_enter(&self, symbol: &str, account: &Account) -> Result<(), RiskVeto> {
+    pub fn can_enter(&self, symbol: &str, account: &Account, current_symbol_positions: u32) -> Result<(), RiskVeto> {
         // Check daily loss limit
         if account.daily_pnl < -self.daily_loss_limit {
             warn!(
                 daily_pnl = account.daily_pnl,
                 limit = -self.daily_loss_limit,
-                "Entry blocked: daily limit hit"
+                "Entry blocked: daily limit reached (${:.2} < ${:.2})", 
+                account.daily_pnl, -self.daily_loss_limit
             );
             return Err(RiskVeto::DailyLimitHit);
         }
         
-        // Only one position at a time
-        if account.open_positions > 0 {
-            return Err(RiskVeto::PositionExists);
+        // Global parallel trade limit
+        if account.open_positions >= self.max_parallel_trades {
+            return Err(RiskVeto::MaxParallelTradesReached);
+        }
+
+        // Per-symbol parallel trade limit
+        if current_symbol_positions >= self.max_trades_per_symbol {
+            return Err(RiskVeto::MaxTradesPerSymbolReached);
         }
         
-        let max_spread = self.get_max_spread_multiplier(symbol);
-        // Check spread
-        if account.current_spread > account.avg_spread * max_spread {
+        let max_spread_mult = self.get_max_spread_multiplier(symbol);
+        let max_spread_pips = self.get_max_spread_pips(symbol);
+
+        // Check spread multiplier
+        if account.current_spread > account.avg_spread * max_spread_mult {
             warn!(
                 symbol = symbol,
                 current = account.current_spread,
-                limit = account.avg_spread * max_spread,
-                "Entry blocked: spread too wide"
+                limit = account.avg_spread * max_spread_mult,
+                "Entry blocked: spread too wide ({:.2} > {:.2} limit)",
+                account.current_spread, account.avg_spread * max_spread_mult
+            );
+            return Err(RiskVeto::SpreadTooWide);
+        }
+
+        // Check absolute spread cap
+        if account.current_spread > max_spread_pips {
+            warn!(
+                symbol = symbol,
+                current = account.current_spread,
+                limit = max_spread_pips,
+                "Entry blocked: absolute spread cap hit ({:.2} > {} pips)",
+                account.current_spread, max_spread_pips
             );
             return Err(RiskVeto::SpreadTooWide);
         }
@@ -209,7 +246,8 @@ impl RiskEnforcer {
                 symbol = symbol,
                 latency = account.current_latency_ms,
                 max = max_latency,
-                "Entry blocked: latency too high"
+                "Entry blocked: high network latency ({}ms > {}ms max)",
+                account.current_latency_ms, max_latency
             );
             return Err(RiskVeto::LatencyTooHigh);
         }
@@ -290,12 +328,24 @@ impl RiskEnforcer {
     }
     
     /// Check if a reversal has occurred (30% of run profit lost)
-    pub fn check_reversal(&self, run: &TradingRun) -> bool {
-        if run.peak_profit <= 0.0 {
-            return false; // No profit to lose
+    /// CRITICAL: Only triggers if peak profit was significant to avoid noise
+    pub fn check_reversal(&self, run: &TradingRun, pip_multiplier: f64) -> bool {
+        // Only consider reversal if we've reached a significant peak (e.g. 3 pips)
+        let min_peak_pips = 3.0; // Minimal "cushion" before reversal tracking starts
+        let peak_pips = (run.peak_profit / run.current_lots) * pip_multiplier; // Rough USD to Pip conversion
+        
+        if run.peak_profit <= 0.0 || peak_pips < min_peak_pips {
+            return false;
         }
         
         let current_pnl = run.total_pnl();
+        
+        // If we are actually in a loss, don't let "reversal" logic handle it.
+        // Let Stop Loss or Stall handle losers. Reversal is for profit harvesting.
+        if current_pnl <= 0.0 {
+            return false;
+        }
+
         let drawdown = run.peak_profit - current_pnl;
         let drawdown_pct = drawdown / run.peak_profit;
         
@@ -358,22 +408,22 @@ mod tests {
     fn test_reversal_detection() {
         let enforcer = RiskEnforcer::new(&default_config());
         
-        let mut run = TradingRun::new("EURUSD".to_string(), 1.0, 0.01, 0);
+        let mut run = TradingRun::new("EURUSD".to_string(), 1.0, 0.01, 0, 5.0, 10.0);
         run.locked_profit = 10.0;
         run.peak_profit = 100.0;
         run.unrealized_pnl = 75.0; // Total P&L = 85, drawdown = 15%
         
-        assert!(!enforcer.check_reversal(&run));
+        assert!(!enforcer.check_reversal(&run, 10000.0));
         
         run.unrealized_pnl = 55.0; // Total P&L = 65, drawdown = 35%
-        assert!(enforcer.check_reversal(&run));
+        assert!(enforcer.check_reversal(&run, 10000.0));
     }
     
     #[test]
     fn test_scale_blocked_without_locked_profit() {
         let enforcer = RiskEnforcer::new(&default_config());
         
-        let run = TradingRun::new("EURUSD".to_string(), 1.0, 0.01, 0);
+        let run = TradingRun::new("EURUSD".to_string(), 1.0, 0.01, 0, 5.0, 10.0);
         // No locked profit = cannot scale
         assert_eq!(enforcer.can_scale(&run), Err(RiskVeto::InsufficientLockedProfit));
     }
@@ -382,7 +432,7 @@ mod tests {
     fn test_max_scales_enforced() {
         let enforcer = RiskEnforcer::new(&default_config());
         
-        let mut run = TradingRun::new("EURUSD".to_string(), 1.0, 0.01, 0);
+        let mut run = TradingRun::new("EURUSD".to_string(), 1.0, 0.01, 0, 5.0, 10.0);
         run.locked_profit = 100.0;
         run.scale_count = 3; // Already at max
         
@@ -395,6 +445,7 @@ mod tests {
         let mut overrides = std::collections::HashMap::new();
         overrides.insert("BTCUSDm".to_string(), crate::SymbolOverride {
             max_spread_multiplier: Some(10.0),
+            max_spread_pips: Some(80.0),
             max_latency_ms: Some(200),
             max_slippage_pips: Some(50.0),
             stall_timeout_ms: Some(60000),

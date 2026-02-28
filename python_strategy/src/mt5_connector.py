@@ -29,7 +29,17 @@ class MT5Connector:
 
     def connect(self):
         """Initializes and logs into the MT5 terminal."""
-        if not mt5.initialize(path=self.path if self.path else None):
+        logger.info(f"Attempting to initialize MT5. Configured path: {self.path}")
+        
+        init_params = {}
+        if self.path:
+            if os.path.exists(self.path):
+                init_params['path'] = self.path
+                logger.info(f"Using custom MT5 path: {self.path}")
+            else:
+                logger.warning(f"Configured MT5_PATH does not exist: {self.path}. Falling back to default search.")
+        
+        if not mt5.initialize(**init_params):
             logger.error(f"initialize() failed, error code = {mt5.last_error()}")
             return False
 

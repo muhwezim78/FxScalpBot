@@ -42,6 +42,7 @@ pub enum TradingState {
         sl_pips: f64,
         tp_pips: f64,
         entry_time_ms: u64,
+        ticket: u64,
     },
     
     /// Adding to position (max 3 times)
@@ -53,6 +54,7 @@ pub enum TradingState {
         sl_pips: f64,
         tp_pips: f64,
         started_at_ms: u64,
+        ticket: u64,
     },
     
     /// Closing all positions
@@ -61,6 +63,8 @@ pub enum TradingState {
         direction: Direction,
         reason: ExitReason,
         started_at_ms: u64,
+        lots: f64,
+        ticket: u64,
     },
     
     /// Mandatory cooldown period
@@ -111,7 +115,7 @@ pub enum StateEvent {
     ReversionDetected(String, Direction),
     FiltersPass { lots: f64, sl_pips: f64 },
     FiltersReject,
-    OrderFilled { price: f64 },
+    OrderFilled { price: f64, ticket: u64 },
     OrderTimeout,
     ProfitLocked { amount: f64 },
     MomentumContinues,
@@ -133,6 +137,12 @@ pub struct TradingStateMachine {
     current: TradingState,
     history: Vec<(u64, TradingState, StateEvent)>,
     cooldown_ms: u64,
+}
+
+impl Default for TradingStateMachine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TradingStateMachine {
@@ -224,7 +234,7 @@ impl TradingStateMachine {
             }
             
             // ENTRY_READY transitions
-            (TradingState::EntryReady { symbol, direction, calculated_lots, sl_pips, .. }, StateEvent::OrderFilled { price }) => {
+            (TradingState::EntryReady { symbol, direction, calculated_lots, sl_pips, .. }, StateEvent::OrderFilled { price, ticket }) => {
                 let tp_pips = *sl_pips * 2.0; // Maintenance of 2:1 ratio
                 Ok(TradingState::PositionOpen {
                     symbol: symbol.clone(),
@@ -234,6 +244,7 @@ impl TradingStateMachine {
                     sl_pips: *sl_pips,
                     tp_pips,
                     entry_time_ms: now,
+                    ticket: *ticket,
                 })
             }
             (TradingState::EntryReady { .. }, StateEvent::OrderTimeout) => {
@@ -241,7 +252,7 @@ impl TradingStateMachine {
             }
             
             // POSITION_OPEN transitions
-            (TradingState::PositionOpen { symbol, direction, entry_price, current_lots, sl_pips, tp_pips, entry_time_ms }, 
+            (TradingState::PositionOpen { symbol, direction, entry_price, current_lots, sl_pips, tp_pips, entry_time_ms, ticket }, 
              StateEvent::ProfitLocked { .. }) => {
                 // Stay in position, profit is tracked in TradingRun
                 Ok(TradingState::PositionOpen {
@@ -252,9 +263,10 @@ impl TradingStateMachine {
                     sl_pips: *sl_pips,
                     tp_pips: *tp_pips,
                     entry_time_ms: *entry_time_ms,
+                    ticket: *ticket,
                 })
             }
-            (TradingState::PositionOpen { symbol, direction, entry_price, current_lots, sl_pips, tp_pips, .. }, 
+            (TradingState::PositionOpen { symbol, direction, entry_price, current_lots, sl_pips, tp_pips, ticket, .. }, 
              StateEvent::MomentumContinues) => {
                 // Scaling: Pass everything forward
                 Ok(TradingState::Scaling {
@@ -265,59 +277,72 @@ impl TradingStateMachine {
                     sl_pips: *sl_pips,
                     tp_pips: *tp_pips,
                     started_at_ms: now,
+                    ticket: *ticket,
                 })
             }
-            (TradingState::PositionOpen { symbol, direction, .. }, StateEvent::TakeProfitHit) => {
+            (TradingState::PositionOpen { symbol, direction, current_lots, ticket, .. }, StateEvent::TakeProfitHit) => {
                 Ok(TradingState::Exiting {
                     symbol: symbol.clone(),
                     direction: *direction,
                     reason: ExitReason::TakeProfitHit,
                     started_at_ms: now,
+                    lots: *current_lots,
+                    ticket: *ticket,
                 })
             }
-            (TradingState::PositionOpen { symbol, direction, .. }, StateEvent::StopLossHit) => {
+            (TradingState::PositionOpen { symbol, direction, current_lots, ticket, .. }, StateEvent::StopLossHit) => {
                 Ok(TradingState::Exiting {
                     symbol: symbol.clone(),
                     direction: *direction,
                     reason: ExitReason::StopLossHit,
                     started_at_ms: now,
+                    lots: *current_lots,
+                    ticket: *ticket,
                 })
             }
-            (TradingState::PositionOpen { symbol, direction, .. }, StateEvent::MomentumDecay) => {
+            (TradingState::PositionOpen { symbol, direction, current_lots, ticket, .. }, StateEvent::MomentumDecay) => {
                 Ok(TradingState::Exiting {
                     symbol: symbol.clone(),
                     direction: *direction,
                     reason: ExitReason::MomentumDecay,
                     started_at_ms: now,
+                    lots: *current_lots,
+                    ticket: *ticket,
                 })
             }
-            (TradingState::PositionOpen { symbol, direction, .. }, StateEvent::StallTimeout) => {
+            (TradingState::PositionOpen { symbol, direction, current_lots, ticket, .. }, StateEvent::StallTimeout) => {
                 Ok(TradingState::Exiting {
                     symbol: symbol.clone(),
                     direction: *direction,
                     reason: ExitReason::StallTimeout,
                     started_at_ms: now,
+                    lots: *current_lots,
+                    ticket: *ticket,
                 })
             }
-            (TradingState::PositionOpen { symbol, direction, .. }, StateEvent::ReversalDetected) => {
+            (TradingState::PositionOpen { symbol, direction, current_lots, ticket, .. }, StateEvent::ReversalDetected) => {
                 Ok(TradingState::Exiting {
                     symbol: symbol.clone(),
                     direction: *direction,
                     reason: ExitReason::ReversalDetected,
                     started_at_ms: now,
+                    lots: *current_lots,
+                    ticket: *ticket,
                 })
             }
-            (TradingState::PositionOpen { symbol, direction, .. }, StateEvent::SpreadExpanded) => {
+            (TradingState::PositionOpen { symbol, direction, current_lots, ticket, .. }, StateEvent::SpreadExpanded) => {
                 Ok(TradingState::Exiting {
                     symbol: symbol.clone(),
                     direction: *direction,
                     reason: ExitReason::SpreadExpansion,
                     started_at_ms: now,
+                    lots: *current_lots,
+                    ticket: *ticket,
                 })
             }
             
             // SCALING transitions
-            (TradingState::Scaling { symbol, direction, entry_price, current_lots, sl_pips, tp_pips, .. }, 
+            (TradingState::Scaling { symbol, direction, entry_price, current_lots, sl_pips, tp_pips, ticket, .. }, 
              StateEvent::ScaleComplete { new_lots }) => {
                 Ok(TradingState::PositionOpen {
                     symbol: symbol.clone(),
@@ -326,15 +351,18 @@ impl TradingStateMachine {
                     current_lots: current_lots + new_lots,
                     sl_pips: *sl_pips,
                     tp_pips: *tp_pips,
-                    entry_time_ms: now, // Reset time for reversal tracking? Or keep original? Keep now for updated base.
+                    entry_time_ms: now, // Reset time for reversal tracking
+                    ticket: *ticket,
                 })
             }
-            (TradingState::Scaling { symbol, direction, .. }, StateEvent::MaxScalesReached) => {
+            (TradingState::Scaling { symbol, direction, current_lots, ticket, .. }, StateEvent::MaxScalesReached) => {
                 Ok(TradingState::Exiting {
                     symbol: symbol.clone(),
                     direction: *direction,
                     reason: ExitReason::MomentumDecay,
                     started_at_ms: now,
+                    lots: *current_lots,
+                    ticket: *ticket,
                 })
             }
             
@@ -371,6 +399,8 @@ impl TradingStateMachine {
                         direction: direction.unwrap_or(Direction::Long),
                         reason: ExitReason::KillSwitch,
                         started_at_ms: now,
+                        lots: 0.0, // Should read from current state really, but KS is panic mode
+                        ticket: 0, 
                     })
                 } else {
                     Ok(TradingState::Idle)

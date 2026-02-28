@@ -83,15 +83,20 @@ class TradingService:
 
                     try:
                         request = json.loads(line)
+                        req_id = request.get("req_id")
                         method = request.get("method")
                         params = request.get("params", {})
                         
-                        logger.info(f"Request: {method}")
+                        logger.info(f"Request [{req_id}]: {method}")
                         response = self._process_request(method, params)
+                        if req_id:
+                            response["req_id"] = req_id
                         client_sock.sendall((json.dumps(response) + "\n").encode('utf-8'))
                     except Exception as e:
                         logger.error(f"Error processing {method if 'method' in locals() else 'request'}: {e}")
                         error_resp = {"status": "error", "message": str(e)}
+                        if 'req_id' in locals() and req_id:
+                            error_resp["req_id"] = req_id
                         client_sock.sendall((json.dumps(error_resp) + "\n").encode('utf-8'))
             
             logger.info(f"Client {addr} closed connection")
@@ -114,6 +119,11 @@ class TradingService:
             ticks = params.get("ticks", [])
             from momentum_detector import detect_momentum
             result = detect_momentum(ticks)
+            # Log rejection reasons if signal not detected
+            if not result.get("detected") and result.get("rejection_reasons"):
+                symbol = params.get("symbol", "UNKNOWN")
+                reasons = ", ".join(result.get("rejection_reasons", []))
+                logger.info(f"[{symbol}] Momentum NOT detected: {reasons}")
             return {"status": "ok", "data": result}
         elif method == "analyze_reversion":
             ticks = params.get("ticks", [])
