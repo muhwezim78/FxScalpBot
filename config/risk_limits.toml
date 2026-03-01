@@ -3,7 +3,7 @@
 
 [market]
 # Symbols to monitor and trade
-symbols = ["EURUSDm","XAUUSDm", "GBPUSDm", "BTCUSDm", "XAGUSDm"]
+symbols = ["EURUSDm","XAUUSDm", "GBPUSDm", "BTCUSDm", "XAGUSDm", "ETHUSDm"]
 
 [account]
 # Daily loss limit as percentage of account balance
@@ -79,3 +79,8 @@ max_spread_pips = 5.0 # (~5 cents spread)
 max_spread_multiplier = 1.5
 
 # EURUSD uses globals
+
+[overrides.ETHUSDm]
+max_spread_pips = 30.0 # (~$30 spread)
+max_spread_multiplier = 1.5
+max_slippage_pips = 20.0

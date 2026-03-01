@@ -64,6 +64,30 @@ EMA_PERIOD = 20
 ATR_PERIOD = 20                
 
 
+# ── Asset Profile System ─────────────────────────────────────────────
+# Scalable architecture: define per-asset-class filter behavior.
+# volume_required: whether volume surge gate is mandatory (False = auto-pass)
+# breakout_tolerance_points: how many points below the breakout level is still accepted
+ASSET_PROFILES = {
+    "FOREX":  {"volume_required": True,  "breakout_tolerance_points": 0},
+    "CRYPTO": {"volume_required": False, "breakout_tolerance_points": 2},
+    "METALS": {"volume_required": True,  "breakout_tolerance_points": 1},
+}
+
+CRYPTO_KEYWORDS = ["BTC", "ETH", "XRP", "LTC", "SOL", "DOGE", "ADA", "BNB"]
+METALS_KEYWORDS = ["XAU", "XAG", "GOLD", "SILVER"]
+
+
+def get_asset_profile(symbol: str) -> dict:
+    """Determine asset class profile from symbol name."""
+    sym = symbol.upper()
+    if any(k in sym for k in CRYPTO_KEYWORDS):
+        return ASSET_PROFILES["CRYPTO"]
+    if any(k in sym for k in METALS_KEYWORDS):
+        return ASSET_PROFILES["METALS"]
+    return ASSET_PROFILES["FOREX"]
+
+
 def calculate_tick_velocity(mid_prices: np.ndarray, timestamps: np.ndarray) -> float:
     """
     Calculate price velocity (pips per second).
@@ -174,12 +198,13 @@ def calculate_strength(velocity: float, acceleration: float) -> float:
     return min(vel_component + acc_component, 1.0)
 
 
-def detect_momentum(ticks: List[Dict[str, Any]]) -> Dict[str, Any]:
+def detect_momentum(ticks: List[Dict[str, Any]], symbol: str = "") -> Dict[str, Any]:
     """
     Main momentum detection function called from Rust.
     
     Args:
         ticks: List of tick dicts with 'bid', 'ask', 'timestamp' keys
+        symbol: Trading symbol (e.g. 'BTCUSDm') for asset-class-aware filtering
         
     Returns:
         Dict with momentum signal details
@@ -193,6 +218,9 @@ def detect_momentum(ticks: List[Dict[str, Any]]) -> Dict[str, Any]:
             "acceleration": 0.0,
             "volume_surge": False,
         }
+    
+    # Resolve asset profile for adaptive filtering
+    profile = get_asset_profile(symbol)
     
     # Convert to numpy arrays
     recent = ticks[-WINDOW_TICKS:]
@@ -231,26 +259,33 @@ def detect_momentum(ticks: List[Dict[str, Any]]) -> Dict[str, Any]:
     atr_prev = calculate_atr(highs[:-5], lows[:-5], closes[:-5], ATR_PERIOD)
     volatility_expanding = atr_now >= atr_prev if atr_prev > 0 else True  # Relaxed: any expansion counts
 
-    # 4. Breakout Acceptance (Rule 4)
+    # 4. Breakout Acceptance (Rule 4) — with asset-class tolerance
     direction = 1 if velocity > 0 else -1 if velocity < 0 else 0
+    breakout_tolerance = profile["breakout_tolerance_points"] * point
     
-    # Acceptance: Check last 2 ticks against the tick before them
+    # Acceptance: Check last 2 ticks against the tick before them (with tolerance)
     acceptance_valid = False
     if len(mid_prices) > 3:
         recent_mids = mid_prices[-2:]
         level = mid_prices[-3]
-        if direction == 1: acceptance_valid = all(p >= level for p in recent_mids)
-        elif direction == -1: acceptance_valid = all(p <= level for p in recent_mids)
+        if direction == 1: acceptance_valid = all(p >= level - breakout_tolerance for p in recent_mids)
+        elif direction == -1: acceptance_valid = all(p <= level + breakout_tolerance for p in recent_mids)
     
     trend_valid = (ema_slope > ema_slope_threshold and direction == 1) or \
                   (ema_slope < -ema_slope_threshold and direction == -1)
 
-    # 5. Volume Gate - Relaxed to 1.0 (any volume)
+    # 5. Volume Gate — adaptive per asset class
     total_vols = np.array([t.get("bid_volume", t.get("volume", 0)) for t in recent])
-    vol_ratio = np.mean(total_vols[-5:]) / np.mean(total_vols[:-5]) if len(total_vols) > 10 else 1.0
-    volume_valid = vol_ratio >= 1.0  
+    vol_mean_prev = np.mean(total_vols[:-5]) if len(total_vols) > 10 else 0.0
+    vol_ratio = np.mean(total_vols[-5:]) / vol_mean_prev if vol_mean_prev > 0 else 1.0
+    
+    if not profile["volume_required"] or np.sum(total_vols) == 0:
+        # Crypto or broker reports zero volume: auto-pass
+        volume_valid = True
+    else:
+        volume_valid = vol_ratio >= 1.0
 
-    # ZERO LAG STATE GATE - Ultra Aggressive
+    # ZERO LAG STATE GATE
     detected = (
         abs(velocity) > velocity_threshold and
         impulse_valid and
@@ -259,6 +294,30 @@ def detect_momentum(ticks: List[Dict[str, Any]]) -> Dict[str, Any]:
         volatility_expanding and
         acceptance_valid
     )
+    
+    # ── Professional Debug Logging ────────────────────────────────────
+    # Log every gate result so silent blockers are immediately visible.
+    import logging
+    _log = logging.getLogger(__name__)
+    
+    asset_class = "CRYPTO" if not profile["volume_required"] else "FOREX/METALS"
+    gate_results = {
+        "Velocity":    f"{'PASS' if abs(velocity) > velocity_threshold else 'FAIL'} ({abs(velocity):.4f} vs {velocity_threshold:.6f})",
+        "Impulse":     f"{'PASS' if impulse_valid else 'FAIL'} (body={quality['body_ratio']:.2f}>={IMPULSE_BODY_RATIO}, close={quality.get('close_pct',0):.2f}<={IMPULSE_CLOSE_PERCENT})",
+        "EMA_Slope":   f"{'PASS' if trend_valid else 'FAIL'} (slope={ema_slope:.6f}, threshold={ema_slope_threshold:.6f}, dir={direction})",
+        "Volume":      f"{'BYPASS' if not profile['volume_required'] or np.sum(total_vols) == 0 else ('PASS' if volume_valid else 'FAIL')} (ratio={vol_ratio:.2f})",
+        "Volatility":  f"{'PASS' if volatility_expanding else 'FAIL'} (atr_now={atr_now:.6f}, atr_prev={atr_prev:.6f})",
+        "Breakout":    f"{'PASS' if acceptance_valid else 'FAIL'} (tolerance={profile['breakout_tolerance_points']}pts)",
+    }
+    
+    if detected:
+        _log.info(f"[{symbol}] *** MOMENTUM DETECTED *** dir={direction} strength={calculate_strength(velocity, acceleration):.2f} | {asset_class}")
+    else:
+        # Only log gate details periodically to avoid spam (every ~50th rejection)
+        import random
+        if random.random() < 0.02:  # ~2% of rejections get full gate dump
+            gates_str = " | ".join(f"{k}:{v}" for k, v in gate_results.items())
+            _log.info(f"[{symbol}] Gates: {gates_str}")
     
     return {
         "detected": bool(detected),

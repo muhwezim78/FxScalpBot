@@ -117,11 +117,11 @@ class TradingService:
             return {"status": "ok", "data": self.connector.get_last_tick(symbol)}
         elif method == "analyze_momentum":
             ticks = params.get("ticks", [])
+            symbol = params.get("symbol", "UNKNOWN")
             from momentum_detector import detect_momentum
-            result = detect_momentum(ticks)
+            result = detect_momentum(ticks, symbol=symbol)
             # Log rejection reasons if signal not detected
             if not result.get("detected") and result.get("rejection_reasons"):
-                symbol = params.get("symbol", "UNKNOWN")
                 reasons = ", ".join(result.get("rejection_reasons", []))
                 logger.info(f"[{symbol}] Momentum NOT detected: {reasons}")
             return {"status": "ok", "data": result}
