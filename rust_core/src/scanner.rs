@@ -15,28 +15,62 @@ pub fn scan_for_opportunities(app_state: &Arc<RwLock<AppState>>, bridge: &mut Br
         if let Ok(state) = app_state.read() {
             let symbols = state.config.market.symbols.clone();
             
-            // Count active trades per symbol
+            // Count active trades per symbol (only trades that are actually in play)
             let mut counts = std::collections::HashMap::new();
+            let mut symbol_pnl = std::collections::HashMap::<String, f64>::new();
             for t in &state.active_trades {
-                *counts.entry(t.symbol.clone()).or_insert(0) += 1;
+                let is_active = matches!(
+                    t.state_machine.current_state(), 
+                    fx_scalp_core::TradingState::PositionOpen { .. } 
+                    | fx_scalp_core::TradingState::Exiting { .. } 
+                    | fx_scalp_core::TradingState::EntryReady { .. }
+                );
+                if is_active {
+                    *counts.entry(t.symbol.clone()).or_insert(0u32) += 1;
+                }
+                // Track unrealized P&L for pyramiding check
+                if let Some(run) = &t.active_run {
+                    *symbol_pnl.entry(t.symbol.clone()).or_insert(0.0) += run.total_pnl();
+                }
             }
             
-            let global_count = state.active_trades.len() as u32;
-            (symbols, (counts, global_count, state.config.account.max_parallel_trades, state.config.account.max_trades_per_symbol))
+            let global_count = counts.values().sum::<u32>();
+            let cooldowns = state.execution_cooldowns.clone();
+            (symbols, (counts, symbol_pnl, cooldowns, global_count, state.config.account.max_parallel_trades, state.config.account.max_trades_per_symbol))
         } else {
             error!("Poisoned RwLock on app_state during scan init");
             return;
         }
     };
     
-    let (counts, global_count, max_global, max_per_symbol) = capacity_data;
+    let (counts, symbol_pnl, cooldowns, global_count, max_global, max_per_symbol) = capacity_data;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
 
     // Only scan if we have global capacity
     if global_count < max_global {
         for symbol in symbols {
-            // Check per-symbol capacity
+            // Check execution cooldown (e.g. after "No money" rejection)
+            if let Some(&cooldown_until) = cooldowns.get(&symbol) {
+                if now < cooldown_until {
+                    continue; // Symbol is in cooldown, skip scanning
+                }
+            }
+            
+            // Check per-symbol: block new entries if existing trades are in LOSS
             let symbol_count = *counts.get(&symbol).unwrap_or(&0);
-            if symbol_count >= max_per_symbol {
+            let symbol_total_pnl = symbol_pnl.get(&symbol).copied().unwrap_or(0.0);
+            
+            // Rule: If any existing trades on this symbol and they are losing, do NOT pile on
+            if symbol_count > 0 && symbol_total_pnl < 0.0 {
+                continue; // Existing trades are underwater — don't add more
+            }
+            
+            // Pyramiding: allow above max if existing trades are in good profit ($5+)
+            let is_profitable = symbol_total_pnl > 5.0;
+            if symbol_count >= max_per_symbol && !is_profitable {
                continue; 
             }
 

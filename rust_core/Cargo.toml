@@ -19,6 +19,11 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 rust_decimal = { version = "1.33", features = ["serde"] }
 uuid = { version = "1.21.0", features = ["v4"] }
 
+# ZeroMQ IPC (pure Rust — no C libzmq needed)
+zeromq = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+
 [features]
 default = []
 

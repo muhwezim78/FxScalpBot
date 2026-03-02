@@ -189,8 +189,9 @@ impl RiskEnforcer {
             .unwrap_or(self.stall_timeout_ms)
     }
     
-    /// Check if a new entry is allowed
-    pub fn can_enter(&self, symbol: &str, account: &Account, current_symbol_positions: u32) -> Result<(), RiskVeto> {
+    /// Check if a new entry is allowed.
+    /// `is_pyramiding_profitable` bypasses per-symbol limit if existing trades are in good profit.
+    pub fn can_enter(&self, symbol: &str, account: &Account, current_symbol_positions: u32, is_pyramiding_profitable: bool) -> Result<(), RiskVeto> {
         // Check daily loss limit
         if account.daily_pnl < -self.daily_loss_limit {
             warn!(
@@ -207,8 +208,8 @@ impl RiskEnforcer {
             return Err(RiskVeto::MaxParallelTradesReached);
         }
 
-        // Per-symbol parallel trade limit
-        if current_symbol_positions >= self.max_trades_per_symbol {
+        // Per-symbol parallel trade limit (bypassed if existing trades are profitable — scalp pyramiding)
+        if current_symbol_positions >= self.max_trades_per_symbol && !is_pyramiding_profitable {
             return Err(RiskVeto::MaxTradesPerSymbolReached);
         }
         

@@ -2,8 +2,8 @@
 # These are HARD LIMITS enforced by Rust. No exceptions.
 
 [market]
-# Symbols to monitor and trade
-symbols = ["EURUSDm","XAUUSDm", "GBPUSDm", "BTCUSDm", "XAGUSDm", "ETHUSDm"]
+# Symbols to monitor and trade 
+symbols = ["EURUSDm","XAUUSDm","XAGUSDm","BTCUSDm", "GBPUSDm", "ETHUSDm"]
 
 [account]
 # Daily loss limit as percentage of account balance

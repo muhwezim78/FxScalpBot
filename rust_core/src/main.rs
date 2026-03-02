@@ -4,7 +4,7 @@ mod trade_manager;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
-use tracing::{info, error};
+use tracing::{info, warn, error};
 
 use fx_scalp_core::{
     AppConfig, AppState, bridge_client::{BridgeClient, BridgeMessage}
@@ -45,9 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let initial_balance = 10000.0; 
     let app_state = Arc::new(RwLock::new(AppState::new(config, initial_balance)));
     
-    // Connect to Python Bridge
-    let bridge_addr = "127.0.0.1:5555";
-    let mut bridge = match BridgeClient::connect(bridge_addr) {
+    // Connect to Python Bridge via ZeroMQ
+    let bridge_addr = "127.0.0.1";
+    let (mut bridge, bridge_rx) = match BridgeClient::connect(bridge_addr) {
         Ok(b) => b,
         Err(e) => {
             error!("Failed to connect to TradingService at {}: {}", bridge_addr, e);
@@ -56,8 +56,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Start Bridge Listener
-    let bridge_rx = bridge.start_listener();
+    // Give ZMQ sockets time to connect
+    thread::sleep(Duration::from_millis(500));
 
     // Initial Account Sync
     if let Ok(data) = bridge.request("get_account", None) {
@@ -150,6 +150,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let _now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+
+        // 2b. Process Async Execution Results (from ZMQ PULL socket)
+        while let Ok(result) = bridge.async_result_rx.try_recv() {
+            let req_id = result.req_id.clone();
+            let mut state = app_state.write().unwrap();
+            
+            // Deferred cooldown insertion (to avoid double mutable borrow)
+            let mut cooldown_symbol: Option<String> = None;
+            
+            // Find the trade that owns this req_id
+            if let Some(trade) = state.active_trades.iter_mut().find(|t| {
+                t.pending_req_id.as_deref() == Some(&req_id)
+            }) {
+                trade.pending_req_id = None; // Clear pending marker
+                let is_closing = matches!(trade.state_machine.current_state(), fx_scalp_core::TradingState::Exiting { .. });
+                
+                if result.status == "ok" {
+                    if is_closing {
+                        // This was an async close_position result
+                        info!(symbol = %trade.symbol, "Async position close confirmed");
+                        let _ = trade.state_machine.process_event(fx_scalp_core::StateEvent::PositionClosed);
+                    } else if let Some(data) = &result.data {
+                        // This was an async execute_order result (OrderFilled)
+                        let price = data.get("price").and_then(|p| p.as_f64());
+                        let ticket = data.get("ticket").and_then(|t| t.as_u64());
+                        if let (Some(price), Some(ticket)) = (price, ticket) {
+                            info!(
+                                symbol = %trade.symbol, ticket = ticket, price = price,
+                                "Async order filled successfully"
+                            );
+                            let _ = trade.state_machine.process_event(
+                                fx_scalp_core::StateEvent::OrderFilled { price, ticket }
+                            );
+                        } else {
+                            error!(symbol = %trade.symbol, "Async fill missing price/ticket");
+                            let _ = trade.state_machine.process_event(fx_scalp_core::StateEvent::OrderTimeout);
+                        }
+                    }
+                } else {
+                    let msg = result.message.as_deref().unwrap_or("unknown");
+                    if is_closing {
+                        error!(symbol = %trade.symbol, message = msg, "Async close failed — forcing closed");
+                        let _ = trade.state_machine.process_event(fx_scalp_core::StateEvent::PositionClosed);
+                    } else {
+                        error!(symbol = %trade.symbol, message = msg, "Async execution failed");
+                        let _ = trade.state_machine.process_event(fx_scalp_core::StateEvent::OrderTimeout);
+                        cooldown_symbol = Some(trade.symbol.clone());
+                    }
+                }
+            } else {
+                warn!(req_id = %req_id, "Received async result for unknown trade");
+            }
+            
+            // Apply deferred cooldown (borrow on active_trades is now released)
+            if let Some(sym) = cooldown_symbol {
+                let cooldown_until = _now + 30_000;
+                state.execution_cooldowns.insert(sym, cooldown_until);
+            }
+        }
 
         // 3. SCANNING PHASE
         scanner::scan_for_opportunities(&app_state, &mut bridge);

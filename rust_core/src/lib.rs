@@ -121,6 +121,8 @@ pub struct ActiveTrade {
     pub symbol: String,
     pub state_machine: TradingStateMachine,
     pub active_run: Option<TradingRun>,
+    /// Tracks the ZMQ req_id for a pending async execution (order or close)
+    pub pending_req_id: Option<String>,
 }
 
 impl ActiveTrade {
@@ -130,6 +132,7 @@ impl ActiveTrade {
             symbol,
             state_machine: TradingStateMachine::new(),
             active_run: None,
+            pending_req_id: None,
         }
     }
 }
@@ -148,6 +151,9 @@ pub struct AppState {
     pub daily_pnl: f64,
     pub open_positions_count: u32,
     pub trade_journal: trade_journal::TradeJournal,
+    /// Per-symbol cooldown after execution failure (e.g. "No money")
+    /// Maps symbol -> timestamp_ms when cooldown expires
+    pub execution_cooldowns: std::collections::HashMap<String, u64>,
 }
 
 impl AppState {
@@ -172,6 +178,7 @@ impl AppState {
             daily_pnl: 0.0,
             open_positions_count: 0,
             trade_journal: trade_journal::TradeJournal::new("logs/trade_journal.csv"),
+            execution_cooldowns: std::collections::HashMap::new(),
         }
     }
 }

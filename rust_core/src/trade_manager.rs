@@ -25,7 +25,7 @@ pub fn update_active_trades(app_state: &Arc<RwLock<AppState>>, bridge: &mut Brid
     
     for i in 0..trade_count {
          // Extract Trade State & Market Data
-         let (current_trade_state, tick_info, account_snapshot, trade_symbol) = {
+         let (current_trade_state, tick_info, account_snapshot, trade_symbol, trade_id) = {
             if let Ok(state) = app_state.read() {
                 if i >= state.active_trades.len() { break; } 
             
@@ -37,6 +37,7 @@ pub fn update_active_trades(app_state: &Arc<RwLock<AppState>>, bridge: &mut Brid
 
                 let trade = &state.active_trades[i];
                 let symbol = trade.symbol.clone();
+                let t_id = trade.id;
                 let tm = trade.state_machine.current_state().clone();
                 
                 let (tick, spread, avg_spread, latency) = if let Some(buf) = state.tick_ingestion.get_buffer(&symbol) {
@@ -59,7 +60,7 @@ pub fn update_active_trades(app_state: &Arc<RwLock<AppState>>, bridge: &mut Brid
                     current_latency_ms: latency as u64,
                 };
                 
-                (tm, tick, acc, symbol)
+                (tm, tick, acc, symbol, t_id)
             } else {
                 error!("Poisoned RwLock on app_state during trade processing");
                 break;
@@ -72,9 +73,29 @@ pub fn update_active_trades(app_state: &Arc<RwLock<AppState>>, bridge: &mut Brid
                  // Check Risk Enforcer
                  if tick_info.is_some() {
                     let state = app_state.read().unwrap();
-                    let sym_count = state.active_trades.iter().filter(|t| t.symbol == trade_symbol).count() as u32;
+                    // FIX: Exclude self from symbol count to prevent off-by-one veto loop.
+                    // Also only count trades that are actually in PositionOpen state.
+                    let sym_count = state.active_trades.iter().filter(|t| {
+                        t.symbol == trade_symbol 
+                        && t.id != trade_id
+                        && matches!(t.state_machine.current_state(), TradingState::PositionOpen { .. } | TradingState::Exiting { .. } | TradingState::EntryReady { .. })
+                    }).count() as u32;
                     
-                    match risk_enforcer.can_enter(&trade_symbol, &account_snapshot, sym_count) {
+                    // Pyramiding P&L check
+                    let symbol_unrealized_pnl: f64 = state.active_trades.iter()
+                        .filter(|t| t.symbol == trade_symbol && t.id != trade_id)
+                        .filter_map(|t| t.active_run.as_ref())
+                        .map(|r| r.total_pnl())
+                        .sum();
+                    
+                    // LOSS GUARD: If existing trades on this symbol are underwater, block new entries
+                    if sym_count > 0 && symbol_unrealized_pnl < 0.0 {
+                        warn!(symbol = %trade_symbol, pnl = symbol_unrealized_pnl, "Entry blocked: existing trades are in loss");
+                        Some(StateEvent::FiltersReject)
+                    } else {
+                    let is_pyramiding_profitable = symbol_unrealized_pnl > 5.0; // $5 profit threshold
+                    
+                    match risk_enforcer.can_enter(&trade_symbol, &account_snapshot, sym_count, is_pyramiding_profitable) {
                         Ok(_) => {
                             let avg_spread = account_snapshot.avg_spread;
                             let base_min_sl = if account_snapshot.current_spread > 0.0 { avg_spread * 8.0 } else { 20.0 };
@@ -98,11 +119,24 @@ pub fn update_active_trades(app_state: &Arc<RwLock<AppState>>, bridge: &mut Brid
                             Some(StateEvent::FiltersReject)
                         }
                     }
+                    } // End of LOSS GUARD else block
                  } else {
                     Some(StateEvent::FiltersReject)
                  }
              },
              TradingState::EntryReady { direction, calculated_lots, sl_pips, .. } => {
+                 // GUARD: If an async order is already in flight, do NOT re-send
+                 {
+                     if let Ok(state) = app_state.read() {
+                         if let Some(trade) = state.active_trades.get(i) {
+                             if trade.pending_req_id.is_some() {
+                                 // Async execution in progress — skip until result arrives via PULL
+                                 continue;
+                             }
+                         }
+                     }
+                 }
+
                  let side = if direction == Direction::Long { "buy" } else { "sell" };
                  let (multiplier, bid, ask) = if let Some(t) = tick_info {
                      (t.pip_multiplier(), t.bid, t.ask)
@@ -123,18 +157,74 @@ pub fn update_active_trades(app_state: &Arc<RwLock<AppState>>, bridge: &mut Brid
                  info!(symbol = %trade_symbol, "Executing Order...");
                  match bridge.request("execute_order", Some(params)) {
                       Ok(resp) => {
-                          if let Some(price) = resp.get("price").and_then(|p| p.as_f64()) {
-                              let ticket = resp.get("ticket").and_then(|t| t.as_u64()).unwrap_or(0);
-                              Some(StateEvent::OrderFilled { price, ticket })
+                          let status = resp.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                          
+                          if status == "pending" {
+                              // ASYNC: Python accepted, execution happening in background.
+                              // Store the req_id so we can match the async result later.
+                              let req_id = resp.get("req_id").and_then(|r| r.as_str()).map(|s| s.to_string());
+                              if let Ok(mut state) = app_state.write() {
+                                  if let Some(trade) = state.active_trades.get_mut(i) {
+                                      trade.pending_req_id = req_id;
+                                  }
+                              }
+                              info!(symbol = %trade_symbol, "Order submitted async — waiting for fill via PULL");
+                              // Stay in EntryReady — the async result processor in main.rs will fire OrderFilled
+                              None
+                          } else if status == "ok" {
+                              // Synchronous fill (fallback / direct response)
+                              if let Some(data) = resp.get("data") {
+                                  let price = data.get("price").and_then(|p| p.as_f64());
+                                  let ticket = data.get("ticket").and_then(|t| t.as_u64());
+                                  if let (Some(price), Some(ticket)) = (price, ticket) {
+                                      info!(symbol = %trade_symbol, ticket = ticket, price = price, "Order filled successfully");
+                                      Some(StateEvent::OrderFilled { price, ticket })
+                                  } else {
+                                      error!(symbol = %trade_symbol, "execute_order returned ok but missing price/ticket in data");
+                                      Some(StateEvent::OrderTimeout)
+                                  }
+                              } else {
+                                  error!(symbol = %trade_symbol, "execute_order returned ok but no data object");
+                                  Some(StateEvent::OrderTimeout)
+                              }
                           } else {
-                             Some(StateEvent::OrderTimeout)
-                         }
+                              let msg = resp.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+                              let code = resp.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
+                              error!(symbol = %trade_symbol, code = code, message = msg, "Order rejected by MT5");
+                              // Record cooldown to prevent infinite retry loop
+                              if let Ok(mut state) = app_state.write() {
+                                  let cooldown_until = now + 30_000; // 30 second cooldown
+                                  state.execution_cooldowns.insert(trade_symbol.clone(), cooldown_until);
+                                  warn!(symbol = %trade_symbol, cooldown_secs = 30, "Execution cooldown activated after rejection");
+                              }
+                              Some(StateEvent::OrderTimeout)
+                          }
                      }
-                     Err(_) => Some(StateEvent::OrderTimeout)
+                     Err(e) => {
+                         error!(symbol = %trade_symbol, error = %e, "Bridge request failed for execute_order");
+                         // Record cooldown to prevent infinite retry loop
+                         if let Ok(mut state) = app_state.write() {
+                             let cooldown_until = now + 30_000; // 30 second cooldown
+                             state.execution_cooldowns.insert(trade_symbol.clone(), cooldown_until);
+                             warn!(symbol = %trade_symbol, cooldown_secs = 30, "Execution cooldown activated after bridge error");
+                         }
+                         Some(StateEvent::OrderTimeout)
+                     }
                  }
              },
              TradingState::PositionOpen { .. } => None,
              TradingState::Exiting { direction, lots, ticket, .. } => {
+                  // GUARD: If an async close is already in flight, do NOT re-send
+                  {
+                      if let Ok(state) = app_state.read() {
+                          if let Some(trade) = state.active_trades.get(i) {
+                              if trade.pending_req_id.is_some() {
+                                  continue;
+                              }
+                          }
+                      }
+                  }
+
                   let side = if direction == Direction::Long { "sell" } else { "buy" };
                   let params = serde_json::json!({ 
                       "symbol": trade_symbol, 
@@ -144,8 +234,31 @@ pub fn update_active_trades(app_state: &Arc<RwLock<AppState>>, bridge: &mut Brid
                   }); 
                   
                   match bridge.request("close_position", Some(params)) {
-                     Ok(_) => Some(StateEvent::PositionClosed),
-                     Err(_) => None
+                     Ok(resp) => {
+                         let status = resp.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                         if status == "pending" {
+                             // ASYNC: Close submitted to background thread
+                             let req_id = resp.get("req_id").and_then(|r| r.as_str()).map(|s| s.to_string());
+                             if let Ok(mut state) = app_state.write() {
+                                 if let Some(trade) = state.active_trades.get_mut(i) {
+                                     trade.pending_req_id = req_id;
+                                 }
+                             }
+                             info!(symbol = %trade_symbol, "Close submitted async — waiting for confirmation");
+                             None // Stay in Exiting, async result processor will fire PositionClosed
+                         } else if status == "ok" {
+                             info!(symbol = %trade_symbol, "Position closed successfully");
+                             Some(StateEvent::PositionClosed)
+                         } else {
+                             let msg = resp.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+                             error!(symbol = %trade_symbol, message = msg, "Close position rejected by MT5, forcing Idle");
+                             Some(StateEvent::PositionClosed)
+                         }
+                     }
+                     Err(e) => {
+                         error!(symbol = %trade_symbol, error = %e, "Bridge request failed for close_position");
+                         Some(StateEvent::PositionClosed)
+                     }
                  }
              },
              TradingState::Cooldown { until_ms } => {
@@ -191,12 +304,38 @@ pub fn update_active_trades(app_state: &Arc<RwLock<AppState>>, bridge: &mut Brid
                                 
                                 run.update_price(current_price, pnl, now);
                                 
-                                // CHECK EXITS (Reversal or Stall)
-                                if risk_enforcer.check_reversal(run, multiplier) {
-                                    let _ = trade.state_machine.process_event(StateEvent::ReversalDetected);
-                                } else if risk_enforcer.check_stall(run, now) {
-                                    let _ = trade.state_machine.process_event(StateEvent::StallTimeout);
+                                // CHECK EXITS: Only close profitable trades
+                                // TP hit → always close (guaranteed profit)
+                                if pips >= tp_pips {
+                                    info!(
+                                        symbol = %trade.symbol, pips = pips, tp = tp_pips, pnl = pnl,
+                                        "*** TAKE PROFIT HIT *** Closing position"
+                                    );
+                                    let _ = trade.state_machine.process_event(StateEvent::TakeProfitHit);
+                                } else if pips <= -(sl_pips * 3.0) {
+                                    // EMERGENCY HARD STOP: 3x normal SL — account protection override
+                                    warn!(
+                                        symbol = %trade.symbol, pips = pips, emergency_sl = -(sl_pips * 3.0), pnl = pnl,
+                                        "*** EMERGENCY STOP *** Drawdown too deep, force-closing to protect account"
+                                    );
+                                    let _ = trade.state_machine.process_event(StateEvent::StopLossHit);
+                                } else if pips > 0.0 {
+                                    // Only consider early exits if trade is currently profitable
+                                    if risk_enforcer.check_reversal(run, multiplier) {
+                                        info!(
+                                            symbol = %trade.symbol, pips = pips, pnl = pnl,
+                                            "Reversal detected while profitable — locking in gains"
+                                        );
+                                        let _ = trade.state_machine.process_event(StateEvent::ReversalDetected);
+                                    } else if risk_enforcer.check_stall(run, now) {
+                                        info!(
+                                            symbol = %trade.symbol, pips = pips, pnl = pnl,
+                                            "Stall detected while profitable — locking in gains"
+                                        );
+                                        let _ = trade.state_machine.process_event(StateEvent::StallTimeout);
+                                    }
                                 }
+                                // If pips <= 0 but above emergency: hold the trade, wait for recovery
                             }
                          }
                     }
